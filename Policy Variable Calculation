@@ -1,0 +1,65 @@
+import pandas as pd
+import statsmodels.api as sm
+
+# 1. Load the dataset
+# Make sure the filename matches what you uploaded
+file_path = 'filtered_strict_developing_countries_v27.csv'
+df = pd.read_csv(file_path)
+
+# 2. Prepare the data for regression
+# We need to create the interaction term used in the literature (Ethnic Fractionalization * Assassinations)
+df['EF_ASS'] = df['EF'] * df['ASS']
+
+# Define the variables to be used
+# Dependent Variable: GDP Growth (GDPG)
+# Policy Variables: Budget Balance (BB), Inflation (INFL), Trade Openness (TRD)
+# Control Variables: Log Initial GDP (LGDP), Institutions (WGI), Ethnic Frac (EF), Assassinations (ASS), Interaction (EF_ASS), Money Supply (MS)
+regression_vars = ['GDPG', 'BB', 'INFL', 'TRD', 'LGDP', 'WGI', 'EF', 'ASS', 'EF_ASS', 'MS']
+
+# Create a regression subset (drop rows where any of these specific variables are missing)
+df_reg = df.dropna(subset=regression_vars).copy()
+
+print(f"Observations used for regression: {len(df_reg)}")
+
+# 3. Run the OLS Regression
+Y = df_reg['GDPG']
+X = df_reg[['BB', 'INFL', 'TRD', 'LGDP', 'WGI', 'EF', 'ASS', 'EF_ASS', 'MS']]
+X = sm.add_constant(X) # Adds the intercept (constant) term
+
+model = sm.OLS(Y, X).fit()
+
+# Print the full regression results (this shows you the coefficients/weights)
+print(model.summary())
+
+# 4. Extract Coefficients and Calculate the Base Constant
+coeffs = model.params
+
+# The 'Base Constant' assumes the mean values for all control variables
+# Formula: Intercept + (Mean_LGDP * Coeff_LGDP) + (Mean_WGI * Coeff_WGI) + ... for all controls
+control_vars = ['LGDP', 'WGI', 'EF', 'ASS', 'EF_ASS', 'MS']
+base_constant = coeffs['const']
+
+for var in control_vars:
+    base_constant += coeffs[var] * df_reg[var].mean()
+
+print(f"\nCalculated Base Constant: {base_constant}")
+print(f"Weight for Budget (BB): {coeffs['BB']}")
+print(f"Weight for Inflation (INFL): {coeffs['INFL']}")
+print(f"Weight for Trade (TRD): {coeffs['TRD']}")
+
+# 5. Calculate the Policy Index for the entire dataset
+# Note: We apply the calculated weights to the original dataframe 'df'
+df['Policy_Index'] = (
+    base_constant +
+    coeffs['BB'] * df['BB'] +
+    coeffs['INFL'] * df['INFL'] +
+    coeffs['TRD'] * df['TRD']
+)
+
+# 6. View and Save the Results
+print("\nSample Results:")
+print(df[['Country Name', 'Year', 'BB', 'INFL', 'TRD', 'Policy_Index']].dropna().head())
+
+# Save to CSV
+df.to_csv('my_calculated_policy_index.csv', index=False)
+print("\nFile saved as 'my_calculated_policy_index.csv'")
