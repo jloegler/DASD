@@ -1,0 +1,164 @@
+import pandas as pd
+import numpy as np
+from statsmodels.sandbox.regression.gmm import IV2SLS
+
+# ============================================================
+# 0) LOAD + BASIC SANITY CLEANING
+# ============================================================
+df = pd.read_csv("DASD_Dataset_161225.csv")
+
+# Ensure keys are clean
+df["Country Code"] = df["Country Code"].astype(str)
+df["Year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
+
+# Sort for panel operations
+df = df.sort_values(["Country Code", "Year"]).reset_index(drop=True)
+g = df.groupby("Country Code", sort=False)
+
+# ============================================================
+# 1) CREATE LAGS (LEVELS) USED AS INSTRUMENTS
+#    (We estimate in first differences, but instrument with level lags)
+# ============================================================
+def add_lags(var, max_lag=3):
+    for L in range(1, max_lag + 1):
+        df[f"{var}_L{L}"] = g[var].shift(L)
+
+add_lags("GDPG", 3)
+add_lags("CONS", 3)
+add_lags("AID", 3)
+add_lags("WGI", 3)
+add_lags("POLICY", 3)
+
+# Interactions in levels (and their lags in levels)
+df["AID_WGI"] = df["AID"] * df["WGI"]
+df["AID_POLICY"] = df["AID"] * df["POLICY"]
+
+add_lags("AID_WGI", 3)
+add_lags("AID_POLICY", 3)
+
+# ============================================================
+# 2) FIRST DIFFERENCES (REMOVES COUNTRY FIXED EFFECTS)
+# ============================================================
+diff_cols = [
+    "GDPG", "CONS", "AID", "WGI", "POLICY", "LGDP", "LPOP", "HC", "EF", "ASS", "MS", "TRD",
+    "AID_WGI", "AID_POLICY"
+]
+
+for c in diff_cols:
+    df[f"D_{c}"] = g[c].diff()
+
+# Lagged dependent variable in differences: Δy_{t-1}
+df["D_GDPG_L1"] = g["D_GDPG"].shift(1)
+df["D_CONS_L1"] = g["D_CONS"].shift(1)
+
+# ============================================================
+# 3) HELPER: BUILD YEAR DUMMIES (NUMERIC) AND RUN IV2SLS
+# ============================================================
+def make_year_dummies(data, drop_first=True):
+    yd = pd.get_dummies(data["Year"].astype(int), prefix="Y", drop_first=drop_first)
+    # Force numeric 0/1
+    yd = yd.astype(float)
+    return yd
+
+def ensure_numeric_frame(X: pd.DataFrame) -> pd.DataFrame:
+    """Force every column to numeric float; raise informative error if impossible."""
+    X2 = X.copy()
+    for col in X2.columns:
+        X2[col] = pd.to_numeric(X2[col], errors="coerce")
+    return X2.astype(float)
+
+def run_diff_iv2sls_statsmodels(data, dep, exog, endog, instr, add_time_fe=True):
+    """
+    Difference-IV 2SLS using statsmodels.sandbox IV2SLS.
+
+    dep: str (e.g., "D_GDPG")
+    exog: list[str] (exogenous regressors in differences)
+    endog: list[str] (endogenous regressors, typically includes lagged diff DV + diff AID + diff interactions)
+    instr: list[str] (instruments in LEVELS, typically L2/L3)
+    add_time_fe: bool (adds year dummies)
+    """
+    cols_needed = [dep, "Country Code", "Year"] + exog + endog + instr
+    d = data[cols_needed].dropna().copy()
+
+    # Add year fixed effects (dummies) if requested
+    if add_time_fe:
+        yd = make_year_dummies(d, drop_first=True)
+        d = pd.concat([d.reset_index(drop=True), yd.reset_index(drop=True)], axis=1)
+        exog_full = exog + list(yd.columns)
+    else:
+        exog_full = exog
+
+    # Build matrices
+    Y = d[dep].astype(float)
+
+    # X must include (endog + exog) and MUST include a constant manually if desired.
+    # In differenced equations, a constant is typically not needed (it differences out),
+    # and with year dummies you definitely don't want an extra constant.
+    X = d[endog + exog_full]
+    Z = d[instr + exog_full]  # exogenous vars serve as their own instruments
+
+    # Force numeric
+    X = ensure_numeric_frame(X)
+    Z = ensure_numeric_frame(Z)
+
+    # Fit IV2SLS
+    res = IV2SLS(Y, X, instrument=Z).fit()
+
+    return res, d
+
+# ============================================================
+# 4) SPECIFICATIONS MATCHING YOUR 3 HYPOTHESES
+# ============================================================
+
+print("\n" + "="*60)
+print("H1: ΔGDPG with endogenous ΔGDPG_{t-1} and ΔAID (Diff-IV 2SLS)")
+print("="*60)
+
+h1_dep   = "D_GDPG"
+h1_exog  = ["D_WGI", "D_POLICY", "D_LGDP", "D_LPOP", "D_HC", "D_EF", "D_ASS", "D_MS"]
+h1_endog = ["D_GDPG_L1", "D_AID"]
+h1_instr = ["GDPG_L2", "GDPG_L3", "AID_L2", "AID_L3"]
+
+res_h1, h1_used = run_diff_iv2sls_statsmodels(df, h1_dep, h1_exog, h1_endog, h1_instr, add_time_fe=True)
+print(res_h1.summary())
+
+
+print("\n" + "="*60)
+print("H2: ΔGDPG with instrumented interactions (Diff-IV 2SLS)")
+print("="*60)
+
+h2_dep   = "D_GDPG"
+h2_exog  = ["D_WGI", "D_POLICY", "D_LGDP", "D_TRD", "D_HC", "D_EF", "D_ASS", "D_MS"]
+h2_endog = ["D_GDPG_L1", "D_AID", "D_AID_WGI", "D_AID_POLICY"]
+h2_instr = [
+    "GDPG_L2", "GDPG_L3",
+    "AID_L2", "AID_L3",
+    "AID_WGI_L2", "AID_WGI_L3",
+    "AID_POLICY_L2", "AID_POLICY_L3"
+]
+
+res_h2, h2_used = run_diff_iv2sls_statsmodels(df, h2_dep, h2_exog, h2_endog, h2_instr, add_time_fe=True)
+print(res_h2.summary())
+
+
+print("\n" + "="*60)
+print("H3: ΔCONS with endogenous ΔCONS_{t-1} and ΔAID (Diff-IV 2SLS)")
+print("="*60)
+
+h3_dep   = "D_CONS"
+h3_exog  = ["D_WGI", "D_LGDP", "D_LPOP", "D_HC", "D_EF", "D_ASS", "D_MS"]
+h3_endog = ["D_CONS_L1", "D_AID"]
+h3_instr = ["CONS_L2", "CONS_L3", "AID_L2", "AID_L3"]
+
+res_h3, h3_used = run_diff_iv2sls_statsmodels(df, h3_dep, h3_exog, h3_endog, h3_instr, add_time_fe=True)
+print(res_h3.summary())
+
+# ============================================================
+# 5) (OPTIONAL) QUICK CHECKS: sample sizes used
+# ============================================================
+print("\n" + "-"*60)
+print("Samples used after differencing, lagging, and dropping NAs:")
+print(f"H1 N = {len(h1_used)}")
+print(f"H2 N = {len(h2_used)}")
+print(f"H3 N = {len(h3_used)}")
+print("-"*60)
